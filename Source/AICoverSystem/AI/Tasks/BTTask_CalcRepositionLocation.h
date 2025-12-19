@@ -33,6 +33,9 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Blackboard")
 	FBlackboardKeySelector HasRepositionLocationKey;
 
+	UPROPERTY(EditAnywhere, Category = "Blackboard")
+	FBlackboardKeySelector NextCoverKey;
+
 	UPROPERTY(EditAnywhere, Category = "Reposition")
 	float LateralOffset = 120.0f;
 
