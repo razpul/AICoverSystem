@@ -36,6 +36,13 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
     const FVector ObjectiveLoc = BB->GetValueAsVector(ObjectiveLocationKey.SelectedKeyName);
     const FVector CoverLoc = CurrentCover->GetActorLocation();
 
+    UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(Pawn->GetWorld());
+    if (!NavSys)
+    {
+        BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
+        return EBTNodeResult::Succeeded;
+    }
+
     const FVector Facing = CurrentCover->GetFacingDirection().GetSafeNormal2D();
     FVector AlongCover = FVector::CrossProduct(FVector::UpVector, Facing).GetSafeNormal2D();
     if (AlongCover.IsNearlyZero())
@@ -43,15 +50,10 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
         AlongCover = Pawn->GetActorRightVector().GetSafeNormal2D();
     }
 
-    const FVector CandidateA = CoverLoc + AlongCover * LateralOffset;
-    const FVector CandidateB = CoverLoc - AlongCover * LateralOffset;
-
-    UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(Pawn->GetWorld());
-    if (!NavSys)
-    {
-        BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
-        return EBTNodeResult::Succeeded;
-    }
+    const FVector ToObj = (ObjectiveLoc - CoverLoc).GetSafeNormal2D();
+    const float SideDot = FVector::DotProduct(AlongCover, ToObj);
+    const FVector PreferredSide = (SideDot >= 0.0f) ? AlongCover : -AlongCover;
+    const FVector OtherSide = -PreferredSide;
 
     auto ProjectToNav = [&](const FVector& InLoc, FVector& OutLoc) -> bool
         {
@@ -65,135 +67,92 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
             return false;
         };
 
+    const float ThreatHeight = HighTraceHeight; 
+    const float TargetHeight = (CurrentCover->CoverType == ECoverType::Low) ? LowTraceHeight : HighTraceHeight;
+
     auto IsBlockedFromObjective = [&](const FVector& TestLoc) -> bool
         {
-            const FVector Start = ObjectiveLoc + FVector(0, 0, TraceHeightOffset);
-            const FVector End = TestLoc + FVector(0, 0, TraceHeightOffset);
+            const FVector Start = ObjectiveLoc + FVector(0, 0, ThreatHeight);
+            const FVector End = TestLoc + FVector(0, 0, TargetHeight);
 
             FHitResult Hit;
-            FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionTrace), true);
+            FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionTrace), false);
             Params.AddIgnoredActor(Pawn);
 
             const bool bHit = Pawn->GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
             return bHit;
         };
 
-    auto ScoreCandidate = [&](const FVector& ProjectedLoc) -> float
+
+    auto FindEdgeOnSide = [&](const FVector& SideDir, FVector& OutEdge) -> bool
         {
-            float Score = 0.0f;
+            bool bFoundAny = false;
+            FVector LastBlocked = CoverLoc;
 
-            const bool bBlocked = IsBlockedFromObjective(ProjectedLoc);
-            if (bRequireBlockedFromObjective && !bBlocked)
+            for (float Dist = 0.0f; Dist <= MaxEdgeScanDistance; Dist += EdgeScanStep)
             {
-                return -FLT_MAX; 
+                const FVector Candidate = CoverLoc + SideDir * Dist;
+
+                FVector Proj;
+                if (!ProjectToNav(Candidate, Proj))
+                {
+                    continue;
+                }
+
+                const bool bBlocked = IsBlockedFromObjective(Proj);
+                if (bBlocked)
+                {
+                    bFoundAny = true;
+                    LastBlocked = Proj;
+                }
+                else
+                {
+                    break;
+                }
             }
 
-            if (bBlocked)
+            if (!bFoundAny)
             {
-                Score += 1000.0f; 
+                return false;
             }
 
-            const FVector ToObj = (ObjectiveLoc - CoverLoc).GetSafeNormal2D();
-            const FVector Delta = (ProjectedLoc - CoverLoc);
-            const float Forward = FVector::DotProduct(Delta.GetSafeNormal2D(), ToObj);
-            Score += Forward * 50.0f;
+            FVector InsetLoc = LastBlocked - SideDir * EdgeInset;
+            ProjectToNav(InsetLoc, InsetLoc);
 
-            const float Dist = FVector::Dist2D(ProjectedLoc, CoverLoc);
-            Score -= Dist * 0.5f;
-
-            return Score;
+            OutEdge = InsetLoc;
+            return true;
         };
 
-    auto DrawTraceResult = [&](const FVector& Proj, const FColor& Col)
-        {
-            const FVector Start = ObjectiveLoc + FVector(0, 0, TraceHeightOffset);
-            const FVector End = Proj + FVector(0, 0, TraceHeightOffset);
+    FVector BestLoc = FVector::ZeroVector;
+    bool bHasBest = false;
 
-            FHitResult Hit;
-            FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionTraceDbg), true);
-            Params.AddIgnoredActor(Pawn);
-
-            const bool bHit = Pawn->GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
-
-            DrawDebugSphere(Pawn->GetWorld(), End, 14.0f, 12, Col, false, DebugDrawTime);
-
-            if (bHit)
-            {
-                DrawDebugLine(Pawn->GetWorld(), Start, Hit.ImpactPoint, FColor::Red, false, DebugDrawTime, 0, 2.0f);
-                DrawDebugLine(Pawn->GetWorld(), Hit.ImpactPoint, End, FColor::Green, false, DebugDrawTime, 0, 2.0f);
-            }
-            else
-            {
-                DrawDebugLine(Pawn->GetWorld(), Start, End, FColor::Green, false, DebugDrawTime, 0, 2.0f);
-            }
-        };
-
-    if (bDebugDraw)
+    if (FindEdgeOnSide(PreferredSide, BestLoc))
     {
-        const FVector ObjZ = ObjectiveLoc + FVector(0, 0, TraceHeightOffset);
-        const FVector CoverZ = CoverLoc + FVector(0, 0, TraceHeightOffset);
-
-        DrawDebugSphere(Pawn->GetWorld(), CoverZ, 15.0f, 12, FColor::Cyan, false, DebugDrawTime);
-        DrawDebugSphere(Pawn->GetWorld(), ObjZ, 15.0f, 12, FColor::White, false, DebugDrawTime);
-
-        DrawDebugSphere(Pawn->GetWorld(), CandidateA + FVector(0, 0, TraceHeightOffset), 12.0f, 12, FColor::Yellow, false, DebugDrawTime);
-        DrawDebugSphere(Pawn->GetWorld(), CandidateB + FVector(0, 0, TraceHeightOffset), 12.0f, 12, FColor::Yellow, false, DebugDrawTime);
+        bHasBest = true;
     }
-
-    bool bHasA = false;
-    bool bHasB = false;
-
-    FVector ProjA = FVector::ZeroVector;
-    FVector ProjB = FVector::ZeroVector;
-
-    struct FCandidate
+    else if (FindEdgeOnSide(OtherSide, BestLoc))
     {
-        bool bValid = false;
-        FVector Loc = FVector::ZeroVector;
-        float Score = -FLT_MAX;
-    };
-
-    FCandidate Best;
-
-    bHasA = ProjectToNav(CandidateA, ProjA);
-    if (bHasA)
-    {
-        const float S = ScoreCandidate(ProjA);
-        if (S > Best.Score)
-        {
-            Best.bValid = (S > -FLT_MAX / 2.0f);
-            Best.Loc = ProjA;
-            Best.Score = S;
-        }
-    }
-
-    bHasB = ProjectToNav(CandidateB, ProjB);
-    if (bHasB)
-    {
-        const float S = ScoreCandidate(ProjB);
-        if (S > Best.Score)
-        {
-            Best.bValid = (S > -FLT_MAX / 2.0f);
-            Best.Loc = ProjB;
-            Best.Score = S;
-        }
+        bHasBest = true;
     }
 
     if (bDebugDraw)
     {
-        if (bHasA) { DrawTraceResult(ProjA, FColor::Blue); }
-        if (bHasB) { DrawTraceResult(ProjB, FColor::Magenta); }
+        DrawDebugSphere(Pawn->GetWorld(), CoverLoc + FVector(0, 0, TargetHeight), 18.0f, 12, FColor::Cyan, false, DebugDrawTime);
 
-        if (Best.bValid)
+        if (bHasBest)
         {
-            DrawDebugSphere(Pawn->GetWorld(), Best.Loc + FVector(0, 0, TraceHeightOffset), 22.0f, 16, FColor::White, false, DebugDrawTime);
+            DrawDebugSphere(Pawn->GetWorld(), BestLoc + FVector(0, 0, TargetHeight), 24.0f, 16, FColor::White, false, DebugDrawTime);
+
+            const FVector Start = ObjectiveLoc + FVector(0, 0, ThreatHeight);
+            const FVector End = BestLoc + FVector(0, 0, TargetHeight);
+            DrawDebugLine(Pawn->GetWorld(), Start, End, FColor::Green, false, DebugDrawTime, 0, 2.0f);
         }
     }
 
-    BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, Best.bValid);
-    if (Best.bValid)
+    BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, bHasBest);
+    if (bHasBest)
     {
-        BB->SetValueAsVector(RepositionLocationKey.SelectedKeyName, Best.Loc);
+        BB->SetValueAsVector(RepositionLocationKey.SelectedKeyName, BestLoc);
     }
 
     return EBTNodeResult::Succeeded;
