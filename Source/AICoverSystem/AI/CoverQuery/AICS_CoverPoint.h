@@ -11,8 +11,8 @@ class UArrowComponent;
 UENUM(BlueprintType)
 enum class ECoverType : uint8
 {
-	LOW UMETA(DisplayName = "Low"),
-	HIGH UMETA(DisplayName = "High")
+	Low UMETA(DisplayName = "Low"),
+	High UMETA(DisplayName = "High")
 };
 
 UCLASS()
@@ -43,7 +43,7 @@ public:
 	FVector GetFacingDirection() const;
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "Cover")
-	ECoverType CoverType = ECoverType::HIGH;
+	ECoverType CoverType = ECoverType::High;
 
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
