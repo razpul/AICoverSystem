@@ -15,6 +15,7 @@ public class AICoverSystem : ModuleRules
 			"InputCore", 
 			"EnhancedInput",
 			"AIModule",
-			"GameplayTasks" });
+			"GameplayTasks",
+			"NavigationSystem" });
 	}
 }

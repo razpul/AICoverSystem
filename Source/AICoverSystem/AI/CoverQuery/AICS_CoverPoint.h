@@ -21,7 +21,6 @@ class AICOVERSYSTEM_API AAICS_CoverPoint : public AActor
 	GENERATED_BODY()
 
 public:
-	// Sets default values for this actor's properties
 	AAICS_CoverPoint();
 
 	UFUNCTION(BlueprintCallable, Category = "Cover")
