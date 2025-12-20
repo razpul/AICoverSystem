@@ -5,8 +5,12 @@
 #include "AIController.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "NavigationSystem.h"
+#include "NavigationPath.h"
 #include "GameFramework/Pawn.h"
 #include "DrawDebugHelpers.h"
+#include "Components/PrimitiveComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "GameFramework/Actor.h"
 
 #include <cfloat>
 
@@ -14,42 +18,148 @@
 
 UBTTask_CalcRepositionLocation::UBTTask_CalcRepositionLocation()
 {
-    // name shown in the behavior tree editor
     NodeName = "Calc Reposition Location";
+}
+
+static bool ProjectToNavLimited(UNavigationSystemV1* NavSys, const FVector& InLoc, float ExtentSize, float MaxSnap2D, FVector& OutLoc)
+{
+    if (!NavSys)
+    {
+        return false;
+    }
+
+    FNavLocation Projected;
+    const FVector Extent(ExtentSize, ExtentSize, ExtentSize);
+
+    if (!NavSys->ProjectPointToNavigation(InLoc, Projected, Extent))
+    {
+        return false;
+    }
+
+    OutLoc = Projected.Location;
+
+    if (FVector::Dist2D(OutLoc, InLoc) > MaxSnap2D)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static bool GetActorMinMaxAlongAxis(AActor* Actor, const FVector& Axis, float& OutMin, float& OutMax)
+{
+    if (!Actor)
+    {
+        return false;
+    }
+
+    const FVector N = Axis.GetSafeNormal();
+    bool bHasAny = false;
+
+    OutMin = FLT_MAX;
+    OutMax = -FLT_MAX;
+
+    TInlineComponentArray<UPrimitiveComponent*> PrimComps;
+    Actor->GetComponents(PrimComps);
+
+    for (UPrimitiveComponent* Prim : PrimComps)
+    {
+        if (!Prim || !Prim->IsRegistered())
+        {
+            continue;
+        }
+
+        if (!Prim->IsCollisionEnabled())
+        {
+            continue;
+        }
+
+        if (Prim->GetCollisionResponseToChannel(ECC_Visibility) != ECR_Block)
+        {
+            continue;
+        }
+
+        if (UStaticMeshComponent* SMC = Cast<UStaticMeshComponent>(Prim))
+        {
+            FVector LMin, LMax;
+            SMC->GetLocalBounds(LMin, LMax);
+
+            const FTransform& Xf = SMC->GetComponentTransform();
+
+            const FVector Corners[8] =
+            {
+                Xf.TransformPosition(FVector(LMin.X, LMin.Y, LMin.Z)),
+                Xf.TransformPosition(FVector(LMin.X, LMin.Y, LMax.Z)),
+                Xf.TransformPosition(FVector(LMin.X, LMax.Y, LMin.Z)),
+                Xf.TransformPosition(FVector(LMin.X, LMax.Y, LMax.Z)),
+                Xf.TransformPosition(FVector(LMax.X, LMin.Y, LMin.Z)),
+                Xf.TransformPosition(FVector(LMax.X, LMin.Y, LMax.Z)),
+                Xf.TransformPosition(FVector(LMax.X, LMax.Y, LMin.Z)),
+                Xf.TransformPosition(FVector(LMax.X, LMax.Y, LMax.Z)),
+            };
+
+            for (const FVector& P : Corners)
+            {
+                const float T = FVector::DotProduct(P, N);
+                OutMin = FMath::Min(OutMin, T);
+                OutMax = FMath::Max(OutMax, T);
+                bHasAny = true;
+            }
+
+            continue;
+        }
+
+        const FVector O = Prim->Bounds.Origin;
+        const FVector E = Prim->Bounds.BoxExtent;
+
+        const FVector Corners[8] =
+        {
+            O + FVector(-E.X, -E.Y, -E.Z),
+            O + FVector(-E.X, -E.Y,  E.Z),
+            O + FVector(-E.X,  E.Y, -E.Z),
+            O + FVector(-E.X,  E.Y,  E.Z),
+            O + FVector(E.X, -E.Y, -E.Z),
+            O + FVector(E.X, -E.Y,  E.Z),
+            O + FVector(E.X,  E.Y, -E.Z),
+            O + FVector(E.X,  E.Y,  E.Z),
+        };
+
+        for (const FVector& P : Corners)
+        {
+            const float T = FVector::DotProduct(P, N);
+            OutMin = FMath::Min(OutMin, T);
+            OutMax = FMath::Max(OutMax, T);
+            bHasAny = true;
+        }
+    }
+
+    return bHasAny;
 }
 
 EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
-    // get the basic ai refs we need to run this task
     UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent();
     AAIController* AIC = OwnerComp.GetAIOwner();
     APawn* Pawn = AIC ? AIC->GetPawn() : nullptr;
 
-    // if anything important is missing, fail the task
     if (!BB || !AIC || !Pawn)
     {
         return EBTNodeResult::Failed;
     }
 
-    // read the current cover point from the blackboard
     AAICS_CoverPoint* CurrentCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
     if (!CurrentCover)
     {
-        // no cover means no reposition spot to calculate
         BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
         return EBTNodeResult::Succeeded;
     }
 
-    // read the objective position (threat / target) and the current cover location
     const FVector ObjectiveLoc = BB->GetValueAsVector(ObjectiveLocationKey.SelectedKeyName);
     const FVector CoverLoc = CurrentCover->GetActorLocation();
 
-    // if next cover is set, use it to decide which edge we should move toward
-    // otherwise we just use the objective direction as a fallback
     const AActor* NextCoverActor = Cast<AActor>(BB->GetValueAsObject(NextCoverKey.SelectedKeyName));
     const FVector DirectionTargetLoc = NextCoverActor ? NextCoverActor->GetActorLocation() : ObjectiveLoc;
 
-    // get nav system because we need to project candidate points onto navmesh
     UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(Pawn->GetWorld());
     if (!NavSys)
     {
@@ -57,46 +167,34 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
         return EBTNodeResult::Succeeded;
     }
 
-    // figure out the direction "along" the cover wall
-    // we take the cover facing arrow and get a perpendicular vector (sideways)
     const FVector Facing = CurrentCover->GetFacingDirection().GetSafeNormal2D();
     FVector AlongCover = FVector::CrossProduct(FVector::UpVector, Facing).GetSafeNormal2D();
     if (AlongCover.IsNearlyZero())
     {
-        // safety fallback if facing is weird
         AlongCover = Pawn->GetActorRightVector().GetSafeNormal2D();
     }
 
-    // decide which side is better (left/right) based on where we want to go next
     const FVector ToTarget = (DirectionTargetLoc - CoverLoc).GetSafeNormal2D();
     const float SideDot = FVector::DotProduct(AlongCover, ToTarget);
 
-    // preferred side points more toward the next target
     const FVector PreferredSide = (SideDot >= 0.0f) ? AlongCover : -AlongCover;
     const FVector OtherSide = -PreferredSide;
 
-    // helper: project a world position onto navmesh so move-to can actually reach it
-    // (lambda function = small inline function we define inside this task)
-    auto ProjectToNav = [&](const FVector& InLoc, FVector& OutLoc) -> bool
-        {
-            FNavLocation Projected;
-            const FVector Extent(NavProjectExtent, NavProjectExtent, NavProjectExtent);
-            if (NavSys->ProjectPointToNavigation(InLoc, Projected, Extent))
-            {
-                OutLoc = Projected.Location;
-                return true;
-            }
-            return false;
-        };
-
-    // trace heights:
-    // threat height is usually "standing shot height"
-    // target height depends on cover type (low cover = crouch height)
     const float ThreatHeight = HighTraceHeight;
     const float TargetHeight = (CurrentCover->CoverType == ECoverType::Low) ? LowTraceHeight : HighTraceHeight;
 
-    // helper: line trace from objective -> test location
-    // if it hits something, that means the test spot is blocked from the objective (good cover)
+    auto TraceToObjectiveGetHit = [&](FHitResult& OutHit) -> bool
+        {
+            const FVector Start = CoverLoc + FVector(0, 0, TargetHeight);
+            const FVector End = ObjectiveLoc + FVector(0, 0, ThreatHeight);
+
+            FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionCoverPick), false);
+            Params.AddIgnoredActor(Pawn);
+            Params.AddIgnoredActor(CurrentCover);
+
+            return Pawn->GetWorld()->LineTraceSingleByChannel(OutHit, Start, End, ECC_Visibility, Params);
+        };
+
     auto IsBlockedFromObjective = [&](const FVector& TestLoc) -> bool
         {
             const FVector Start = ObjectiveLoc + FVector(0, 0, ThreatHeight);
@@ -106,67 +204,126 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
             FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionTrace), false);
             Params.AddIgnoredActor(Pawn);
 
-            const bool bHit = Pawn->GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
-            return bHit;
+            return Pawn->GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
         };
 
-    // helper: scan outward on one side until cover breaks
-    // last blocked point is the "edge", then we inset slightly so we still stay behind cover
-    auto FindEdgeOnSide = [&](const FVector& SideDir, FVector& OutEdge) -> bool
+    auto IsGoodLateralMove = [&](const FVector& Dest, const FVector& SideDir) -> bool
         {
-            bool bFoundAny = false;
-            FVector LastBlocked = CoverLoc;
+            FVector StartLoc = Pawn->GetActorLocation();
 
-            // walk in small steps along the wall
-            for (float Dist = 0.0f; Dist <= MaxEdgeScanDistance; Dist += EdgeScanStep)
             {
-                const FVector Candidate = CoverLoc + SideDir * Dist;
-
-                // keep points valid by projecting onto navmesh
-                FVector Proj;
-                if (!ProjectToNav(Candidate, Proj))
+                FNavLocation StartProjected;
+                const FVector Extent(NavProjectExtent, NavProjectExtent, NavProjectExtent);
+                if (NavSys->ProjectPointToNavigation(StartLoc, StartProjected, Extent))
                 {
-                    continue;
-                }
-
-                // if still blocked, we can keep going
-                // if it becomes unblocked, we hit the edge and stop
-                const bool bBlocked = IsBlockedFromObjective(Proj);
-                if (bBlocked)
-                {
-                    bFoundAny = true;
-                    LastBlocked = Proj;
-                }
-                else
-                {
-                    break;
+                    StartLoc = StartProjected.Location;
                 }
             }
 
-            // if we never found any blocked point, this side is not usable
-            if (!bFoundAny)
+            UNavigationPath* Path = NavSys->FindPathToLocationSynchronously(Pawn->GetWorld(), StartLoc, Dest, Pawn);
+            if (!Path || !Path->IsValid() || Path->IsPartial())
             {
                 return false;
             }
 
-            // pull back a little so the ai doesn't stand on the exact edge
-            FVector InsetLoc = LastBlocked - SideDir * EdgeInset;
-            ProjectToNav(InsetLoc, InsetLoc);
+            const TArray<FVector>& Pts = Path->PathPoints;
+            if (Pts.Num() < 2)
+            {
+                return true;
+            }
 
-            OutEdge = InsetLoc;
+            float PathLen2D = 0.0f;
+            for (int32 i = 1; i < Pts.Num(); ++i)
+            {
+                PathLen2D += FVector::Dist2D(Pts[i - 1], Pts[i]);
+            }
+
+            const float Straight2D = FVector::Dist2D(StartLoc, Dest);
+            if (Straight2D < 1.0f)
+            {
+                return true;
+            }
+
+            if (PathLen2D > Straight2D * MaxLateralDetourRatio)
+            {
+                return false;
+            }
+
+            const FVector FirstDir = (Pts[1] - Pts[0]).GetSafeNormal2D();
+            if (FVector::DotProduct(FirstDir, SideDir.GetSafeNormal2D()) < MinFirstStepDot)
+            {
+                return false;
+            }
+
             return true;
         };
 
-    // try to find an edge on the preferred side and the other side
+    FHitResult CoverHit;
+    AActor* CoverActor = nullptr;
+    if (TraceToObjectiveGetHit(CoverHit))
+    {
+        CoverActor = CoverHit.GetActor();
+    }
+
+    if (!CoverActor)
+    {
+        BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
+        return EBTNodeResult::Succeeded;
+    }
+
+    float MinT = 0.0f;
+    float MaxT = 0.0f;
+    if (!GetActorMinMaxAlongAxis(CoverActor, AlongCover, MinT, MaxT))
+    {
+        BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
+        return EBTNodeResult::Succeeded;
+    }
+
+    const FVector AxisN = AlongCover.GetSafeNormal();
+    const float CoverT = FVector::DotProduct(CoverLoc, AxisN);
+
+    FVector RawEdgePlus = CoverLoc + AxisN * (MaxT - CoverT);
+    FVector RawEdgeMinus = CoverLoc + AxisN * (MinT - CoverT);
+
+    FVector EdgePlus = RawEdgePlus - AxisN * EdgeInset;
+    FVector EdgeMinus = RawEdgeMinus + AxisN * EdgeInset;
+
+    auto ValidateAndFixEdge = [&](const FVector& InEdge, const FVector& SideDir, FVector& OutEdge) -> bool
+        {
+            FVector TryLoc = InEdge;
+
+            for (int32 TryIdx = 0; TryIdx <= MaxEdgeInwardTries; ++TryIdx)
+            {
+                FVector Proj;
+                if (ProjectToNavLimited(NavSys, TryLoc, NavProjectExtent, MaxNavSnapDistance2D, Proj))
+                {
+                    if (IsBlockedFromObjective(Proj))
+                    {
+                        if (IsGoodLateralMove(Proj, SideDir))
+                        {
+                            OutEdge = Proj;
+                            return true;
+                        }
+                    }
+                }
+
+                TryLoc = TryLoc - SideDir.GetSafeNormal2D() * EdgeInwardStep;
+            }
+
+            return false;
+        };
+
+    const bool bPlusIsPreferred = FVector::DotProduct(AxisN, PreferredSide) > 0.0f;
+
+    const FVector PrefRaw = bPlusIsPreferred ? EdgePlus : EdgeMinus;
+    const FVector OtherRaw = bPlusIsPreferred ? EdgeMinus : EdgePlus;
+
     FVector EdgePref = FVector::ZeroVector;
     FVector EdgeOther = FVector::ZeroVector;
 
-    const bool bHasPref = FindEdgeOnSide(PreferredSide, EdgePref);
-    const bool bHasOther = FindEdgeOnSide(OtherSide, EdgeOther);
+    const bool bHasPref = ValidateAndFixEdge(PrefRaw, PreferredSide, EdgePref);
+    const bool bHasOther = ValidateAndFixEdge(OtherRaw, OtherSide, EdgeOther);
 
-    // pick the best edge result
-    // - if only one is valid, use it
-    // - if both are valid, choose the one closer to the next cover / target direction
     bool bHasBest = false;
     FVector BestLoc = FVector::ZeroVector;
 
@@ -189,20 +346,26 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
         BestLoc = (DistPref <= DistOther) ? EdgePref : EdgeOther;
     }
 
-    // optional debug draw so we can see what the task is doing in the world
     if (bDebugDraw)
     {
         const FVector CoverZ = CoverLoc + FVector(0, 0, TargetHeight);
         DrawDebugSphere(Pawn->GetWorld(), CoverZ, 18.0f, 12, FColor::Cyan, false, DebugDrawTime);
 
-        // show the direction target (next cover if set, otherwise objective)
+        if (CoverActor)
+        {
+            const FVector CA = CoverActor->GetActorLocation() + FVector(0, 0, TargetHeight);
+            DrawDebugSphere(Pawn->GetWorld(), CA, 16.0f, 12, FColor::Orange, false, DebugDrawTime);
+        }
+
         if (NextCoverActor)
         {
             DrawDebugSphere(Pawn->GetWorld(), DirectionTargetLoc + FVector(0, 0, TargetHeight), 18.0f, 12, FColor::Yellow, false, DebugDrawTime);
             DrawDebugLine(Pawn->GetWorld(), CoverZ, DirectionTargetLoc + FVector(0, 0, TargetHeight), FColor::Yellow, false, DebugDrawTime, 0, 1.5f);
         }
 
-        // show both candidate edges if they were found
+        DrawDebugSphere(Pawn->GetWorld(), EdgePlus + FVector(0, 0, TargetHeight), 12.0f, 12, FColor::Silver, false, DebugDrawTime);
+        DrawDebugSphere(Pawn->GetWorld(), EdgeMinus + FVector(0, 0, TargetHeight), 12.0f, 12, FColor::Silver, false, DebugDrawTime);
+
         if (bHasPref)
         {
             DrawDebugSphere(Pawn->GetWorld(), EdgePref + FVector(0, 0, TargetHeight), 14.0f, 12, FColor::Blue, false, DebugDrawTime);
@@ -212,7 +375,6 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
             DrawDebugSphere(Pawn->GetWorld(), EdgeOther + FVector(0, 0, TargetHeight), 14.0f, 12, FColor::Magenta, false, DebugDrawTime);
         }
 
-        // show the final chosen edge
         if (bHasBest)
         {
             DrawDebugSphere(Pawn->GetWorld(), BestLoc + FVector(0, 0, TargetHeight), 24.0f, 16, FColor::White, false, DebugDrawTime);
@@ -223,7 +385,6 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
         }
     }
 
-    // write results back to the blackboard so the bt can move to it
     BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, bHasBest);
     if (bHasBest)
     {
