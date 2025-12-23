@@ -158,6 +158,10 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 		return EBTNodeResult::Failed;
 	}
 
+	// always reset outputs so we never keep stale reposition data
+	BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
+	BB->ClearValue(RepositionLocationKey.SelectedKeyName);
+
 	// get current cover point
 	AAICS_CoverPoint* CurrentCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
 	if (!CurrentCover)
@@ -166,14 +170,53 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 		return EBTNodeResult::Succeeded;
 	}
 
-	// decide what direction bias we want for next movement (cp or obj)
+	// decide what direction bias we want for next movement (next cover is a hint, but we can ignore it if stale)
 	const FVector ObjectiveLoc = BB->GetValueAsVector(ObjectiveLocationKey.SelectedKeyName);
 	const FVector CoverLoc = CurrentCover->GetActorLocation();
 
 	const AActor* NextCoverActor = Cast<AActor>(BB->GetValueAsObject(NextCoverKey.SelectedKeyName));
-	const FVector DirectionTargetLoc = NextCoverActor ? NextCoverActor->GetActorLocation() : ObjectiveLoc;
 
+	// build 2d dirs
+	FVector ToObj2D = ObjectiveLoc - CoverLoc;
+	ToObj2D.Z = 0.0f;
+	const bool bHasObjDir = ToObj2D.Normalize();
 
+	FVector ToNext2D = FVector::ZeroVector;
+	bool bHasNextDir = false;
+
+	if (NextCoverActor && NextCoverActor != CurrentCover)
+	{
+		ToNext2D = NextCoverActor->GetActorLocation() - CoverLoc;
+		ToNext2D.Z = 0.0f;
+
+		// reject tiny / meaningless next dir
+		if (!ToNext2D.IsNearlyZero(25.0f))
+		{
+			ToNext2D.Normalize();
+			bHasNextDir = true;
+		}
+	}
+
+	// use next cover only if it is not obviously pointing away from the objective
+	bool bUseNext = false;
+	if (bHasNextDir)
+	{
+		if (bHasObjDir)
+		{
+			const float Agreement = FVector::DotProduct(ToNext2D, ToObj2D);
+
+			// if next dir points strongly away from the objective, treat it as stale
+			// tweak this threshold later if you want
+			bUseNext = (Agreement > -0.2f);
+		}
+		else
+		{
+			bUseNext = true;
+		}
+	}
+
+	// pick the effective direction target location
+	const FVector DirectionTargetLoc = (bUseNext && NextCoverActor) ? NextCoverActor->GetActorLocation() : ObjectiveLoc;
 
 	// get nav system
 	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(Pawn->GetWorld());
@@ -214,7 +257,7 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 	const float ThreatHeight = HighTraceHeight;
 	const float TargetHeight = (CurrentCover->CoverType == ECoverType::Low) ? LowTraceHeight : HighTraceHeight;
 
-	// HELPER lambda functions
+	// helper lambda functions
 	// find the cover mesh between cover point and objective
 	auto TraceToObjectiveGetHit = [&](FHitResult& OutHit) -> bool
 		{
@@ -309,14 +352,14 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 				return true;
 			}
 
-			// reject if the first step immediately goes against the side we want 
+			// reject if the first step immediately goes against the side we want
 			const FVector FirstDir = (Pts[1] - Pts[0]).GetSafeNormal2D();
 			if (FVector::DotProduct(FirstDir, SideDir.GetSafeNormal2D()) < -0.15f)
 			{
 				return false;
 			}
 
-			// reject if the path is way longer than a straight line 
+			// reject if the path is way longer than a straight line
 			float PathLen2D = 0.0f;
 			for (int32 i = 1; i < Pts.Num(); ++i)
 			{
@@ -332,9 +375,9 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 			return true;
 		};
 
-
 	FHitResult CoverHit;
 	AActor* CoverActor = nullptr;
+
 	// get cover mesh actor
 	if (TraceToObjectiveGetHit(CoverHit))
 	{
@@ -364,6 +407,7 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 	FVector RawEdgePlus = CoverLoc + AxisN * (MaxT - CoverT);
 	// calc point on actor at negative edge alon axis
 	FVector RawEdgeMinus = CoverLoc + AxisN * (MinT - CoverT);
+
 	// add edge inset so we stand inside more
 	FVector EdgePlus = RawEdgePlus - AxisN * EdgeInset;
 	FVector EdgeMinus = RawEdgeMinus + AxisN * EdgeInset;
@@ -375,6 +419,7 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 			for (int32 TryIdx = 0; TryIdx <= MaxEdgeInwardTries; ++TryIdx)
 			{
 				FVector Proj;
+
 				// project to navmesh
 				if (ProjectToNavLimited(NavSys, TryLoc, NavProjectExtent, MaxNavSnapDistance2D, Proj))
 				{
@@ -391,6 +436,7 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 					}
 				}
 
+				// step inward from this side
 				TryLoc = TryLoc - SideDir.GetSafeNormal2D() * EdgeInwardStep;
 			}
 
@@ -426,6 +472,7 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 	}
 	else if (bHasPref && bHasOther)
 	{
+		// prefer the edge that gives a better exit toward the effective target (next cover if valid, else objective)
 		const float DistPref = FVector::Dist2D(EdgePref, DirectionTargetLoc);
 		const float DistOther = FVector::Dist2D(EdgeOther, DirectionTargetLoc);
 
@@ -433,7 +480,7 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 		BestLoc = (DistPref <= DistOther) ? EdgePref : EdgeOther;
 	}
 
-	// debug draw 
+	// debug draw
 	if (bDebugDraw)
 	{
 		const FVector CoverZ = CoverLoc + FVector(0, 0, TargetHeight);
@@ -445,10 +492,14 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 			DrawDebugSphere(Pawn->GetWorld(), CA, 16.0f, 12, FColor::Orange, false, DebugDrawTime);
 		}
 
+		// draw the effective direction target we're using for edge choice
+		DrawDebugSphere(Pawn->GetWorld(), DirectionTargetLoc + FVector(0, 0, TargetHeight), 18.0f, 12, FColor::Yellow, false, DebugDrawTime);
+		DrawDebugLine(Pawn->GetWorld(), CoverZ, DirectionTargetLoc + FVector(0, 0, TargetHeight), FColor::Yellow, false, DebugDrawTime, 0, 1.5f);
+
+		// optionally show the raw next cover too (so you can see when we ignored it)
 		if (NextCoverActor)
 		{
-			DrawDebugSphere(Pawn->GetWorld(), DirectionTargetLoc + FVector(0, 0, TargetHeight), 18.0f, 12, FColor::Yellow, false, DebugDrawTime);
-			DrawDebugLine(Pawn->GetWorld(), CoverZ, DirectionTargetLoc + FVector(0, 0, TargetHeight), FColor::Yellow, false, DebugDrawTime, 0, 1.5f);
+			DrawDebugSphere(Pawn->GetWorld(), NextCoverActor->GetActorLocation() + FVector(0, 0, TargetHeight), 10.0f, 10, FColor::Purple, false, DebugDrawTime);
 		}
 
 		DrawDebugSphere(Pawn->GetWorld(), EdgePlus + FVector(0, 0, TargetHeight), 12.0f, 12, FColor::Silver, false, DebugDrawTime);
@@ -481,3 +532,4 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 
 	return EBTNodeResult::Succeeded;
 }
+
