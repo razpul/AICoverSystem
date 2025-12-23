@@ -9,7 +9,7 @@
 
 UBTTask_ReserveCover::UBTTask_ReserveCover()
 {
-	NodeName = "reserve cover";
+	NodeName = "Reserve Cover";
 }
 
 EBTNodeResult::Type UBTTask_ReserveCover::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
@@ -31,7 +31,6 @@ EBTNodeResult::Type UBTTask_ReserveCover::ExecuteTask(UBehaviorTreeComponent& Ow
 
 	if (!TargetCover->Reserve(Pawn))
 	{
-		BB->ClearValue(TargetCoverKey.SelectedKeyName);
 		return EBTNodeResult::Failed;
 	}
 
