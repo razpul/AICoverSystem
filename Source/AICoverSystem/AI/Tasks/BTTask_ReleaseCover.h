@@ -22,5 +22,8 @@ public:
 protected:
 	UPROPERTY(EditAnywhere, Category = "Blackboard")
 	FBlackboardKeySelector CurrentCoverKey;
+
+	UPROPERTY(EditAnywhere, Category = "Blackboard")
+	bool bClearKeyAfterRelease = true;
 	
 };

@@ -9,10 +9,9 @@
 
 #include "AICoverSystem/AI/CoverQuery/AICS_CoverPoint.h"
 
-
 UBTTask_SetStanceFromCurrentCover::UBTTask_SetStanceFromCurrentCover()
 {
-	NodeName = "Set Stance From Current Cover";
+	NodeName = "set stance from current cover";
 }
 
 EBTNodeResult::Type UBTTask_SetStanceFromCurrentCover::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
@@ -34,7 +33,7 @@ EBTNodeResult::Type UBTTask_SetStanceFromCurrentCover::ExecuteTask(UBehaviorTree
 	AAICS_CoverPoint* CurrentCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
 	if (!CurrentCover)
 	{
-		return EBTNodeResult::Failed;
+		return EBTNodeResult::Succeeded;
 	}
 
 	const bool bShouldCrouch = (CurrentCover->CoverType == ECoverType::Low);

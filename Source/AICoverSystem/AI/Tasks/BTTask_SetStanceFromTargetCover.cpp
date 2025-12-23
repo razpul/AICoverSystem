@@ -6,11 +6,12 @@
 #include "AIController.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "GameFramework/Character.h"
+
 #include "AICoverSystem/AI/CoverQuery/AICS_CoverPoint.h"
 
 UBTTask_SetStanceFromTargetCover::UBTTask_SetStanceFromTargetCover()
 {
-	NodeName = "Set Stance From Target Cover";
+	NodeName = "set stance from target cover";
 }
 
 EBTNodeResult::Type UBTTask_SetStanceFromTargetCover::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
@@ -22,7 +23,7 @@ EBTNodeResult::Type UBTTask_SetStanceFromTargetCover::ExecuteTask(UBehaviorTreeC
 	{
 		return EBTNodeResult::Failed;
 	}
-
+	
 	ACharacter* Char = Cast<ACharacter>(AIC->GetPawn());
 	if (!Char)
 	{
@@ -32,7 +33,7 @@ EBTNodeResult::Type UBTTask_SetStanceFromTargetCover::ExecuteTask(UBehaviorTreeC
 	AAICS_CoverPoint* TargetCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(TargetCoverKey.SelectedKeyName));
 	if (!TargetCover)
 	{
-		return EBTNodeResult::Failed;
+		return EBTNodeResult::Succeeded;
 	}
 
 	const bool bShouldCrouch = (TargetCover->CoverType == ECoverType::Low);
@@ -50,7 +51,6 @@ EBTNodeResult::Type UBTTask_SetStanceFromTargetCover::ExecuteTask(UBehaviorTreeC
 	{
 		BB->SetValueAsBool(WantsCrouchKey.SelectedKeyName, bShouldCrouch);
 	}
-
 
 	return EBTNodeResult::Succeeded;
 }

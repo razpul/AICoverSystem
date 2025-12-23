@@ -1,6 +1,5 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
-
 #include "BTTask_ReleaseCover.h"
 
 #include "BehaviorTree/BlackboardComponent.h"
@@ -19,18 +18,26 @@ EBTNodeResult::Type UBTTask_ReleaseCover::ExecuteTask(UBehaviorTreeComponent& Ow
 	AAIController* AIC = OwnerComp.GetAIOwner();
 	APawn* Pawn = AIC ? AIC->GetPawn() : nullptr;
 
-	if (!BB || !Pawn) 
+	if (!BB || !Pawn)
 	{
 		return EBTNodeResult::Failed;
 	}
 
-	AAICS_CoverPoint* CurrentCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
-	if (CurrentCover)
+	if (CurrentCoverKey.SelectedKeyName.IsNone())
 	{
-		CurrentCover->Release(Pawn);
+		return EBTNodeResult::Succeeded;
 	}
 
-	BB->ClearValue(CurrentCoverKey.SelectedKeyName);
+	AAICS_CoverPoint* Cover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
+	if (Cover)
+	{
+		Cover->Release(Pawn);
+	}
+
+	if (bClearKeyAfterRelease)
+	{
+		BB->ClearValue(CurrentCoverKey.SelectedKeyName);
+	}
 
 	return EBTNodeResult::Succeeded;
 }

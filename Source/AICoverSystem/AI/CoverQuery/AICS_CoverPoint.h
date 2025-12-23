@@ -33,7 +33,7 @@ public:
 	bool IsReserved() const;
 
 	UFUNCTION(BlueprintPure, Category = "Cover")
-	AActor* GetReservedBy() const { return ReservedBy; }
+	AActor* GetReservedBy() const { return ReservedBy.Get(); }
 
 	UFUNCTION(BlueprintPure, Category = "Cover")
 	FVector GetCoverLocation() const { return GetActorLocation(); }
@@ -51,10 +51,5 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
 	TObjectPtr<UArrowComponent> FacingArrow;
 
-	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category = "Cover")
-	TObjectPtr<AActor> ReservedBy;
-
-public:
-
-
+	TWeakObjectPtr<AActor> ReservedBy;
 };

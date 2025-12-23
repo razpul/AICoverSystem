@@ -1,6 +1,5 @@
 // Fill out your copyright notice in the Description page of Project Settings.
 
-
 #include "BTTask_ReserveCover.h"
 
 #include "BehaviorTree/BlackboardComponent.h"
@@ -10,7 +9,7 @@
 
 UBTTask_ReserveCover::UBTTask_ReserveCover()
 {
-	NodeName = "Reserve Cover";
+	NodeName = "reserve cover";
 }
 
 EBTNodeResult::Type UBTTask_ReserveCover::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
@@ -32,16 +31,9 @@ EBTNodeResult::Type UBTTask_ReserveCover::ExecuteTask(UBehaviorTreeComponent& Ow
 
 	if (!TargetCover->Reserve(Pawn))
 	{
+		BB->ClearValue(TargetCoverKey.SelectedKeyName);
 		return EBTNodeResult::Failed;
 	}
-
-	AAICS_CoverPoint* CurrentCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
-	if (CurrentCover && CurrentCover != TargetCover)
-	{
-		CurrentCover->Release(Pawn);
-	}
-
-	BB->SetValueAsObject(CurrentCoverKey.SelectedKeyName, TargetCover);
 
 	return EBTNodeResult::Succeeded;
 }
