@@ -23,6 +23,15 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Cover")
 	TSubclassOf<class UEnvQueryContext> ObjectiveLocationContext;
 
+	UPROPERTY(EditDefaultsOnly, Category = "Threat")
+	FName EnemyActorKeyName = TEXT("EnemyActor");
+
+	UPROPERTY(EditDefaultsOnly, Category = "Threat")
+	FName LastKnownEnemyLocationKeyName = TEXT("LastKnownEnemyLocation");
+
+	UPROPERTY(EditDefaultsOnly, Category = "Threat")
+	FName HasLOSKeyName = TEXT("HasLOS");
+
 	UPROPERTY(EditDefaultsOnly, Category = "Cover")
 	float LowCoverTraceHeight = 60.0f;
 
