@@ -9,7 +9,7 @@
 #include "GameFramework/Pawn.h"
 #include "DrawDebugHelpers.h"
 #include "Components/PrimitiveComponent.h"
-#include "Components/StaticMeshComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "GameFramework/Actor.h"
 
 #include <cfloat>
@@ -21,7 +21,6 @@ UBTTask_CalcRepositionLocation::UBTTask_CalcRepositionLocation()
 	NodeName = "Calc Reposition Location";
 }
 
-// helper :  project a point onto navmesh and reject if it snaps too far away
 static bool ProjectToNavLimited(UNavigationSystemV1* NavSys, const FVector& InLoc, float ExtentSize, float MaxSnap2D, FVector& OutLoc)
 {
 	if (!NavSys)
@@ -29,7 +28,6 @@ static bool ProjectToNavLimited(UNavigationSystemV1* NavSys, const FVector& InLo
 		return false;
 	}
 
-	// project location onto nav within a search box
 	FNavLocation Projected;
 	const FVector Extent(ExtentSize, ExtentSize, ExtentSize);
 
@@ -47,23 +45,24 @@ static bool ProjectToNavLimited(UNavigationSystemV1* NavSys, const FVector& InLo
 
 	return true;
 }
-// helper: find min/max extent of actor along given axis
-static bool GetActorMinMaxAlongAxis(AActor* Actor, const FVector& Axis, float& OutMin, float& OutMax)
+
+static bool GetActorMinMaxAlongAxis(AActor* Actor, const FVector& AxisN, float& OutMinT, float& OutMaxT)
 {
 	if (!Actor)
 	{
 		return false;
 	}
 
-	// normalise axis
-	const FVector N = Axis.GetSafeNormal();
+	const FVector N = AxisN.GetSafeNormal();
+	if (N.IsNearlyZero())
+	{
+		return false;
+	}
+
 	bool bHasAny = false;
+	float MinT = FLT_MAX;
+	float MaxT = -FLT_MAX;
 
-	// start large
-	OutMin = FLT_MAX;
-	OutMax = -FLT_MAX;
-
-	// get all primitive comps on actor
 	TInlineComponentArray<UPrimitiveComponent*> PrimComps;
 	Actor->GetComponents(PrimComps);
 
@@ -79,45 +78,11 @@ static bool GetActorMinMaxAlongAxis(AActor* Actor, const FVector& Axis, float& O
 			continue;
 		}
 
-		// use comps that block visibility
 		if (Prim->GetCollisionResponseToChannel(ECC_Visibility) != ECR_Block)
 		{
 			continue;
 		}
 
-		// if static mesh, use local bound and transform 8 corners into world space
-		if (UStaticMeshComponent* SMC = Cast<UStaticMeshComponent>(Prim))
-		{
-			FVector LMin, LMax;
-			SMC->GetLocalBounds(LMin, LMax);
-
-			const FTransform& Xf = SMC->GetComponentTransform();
-
-			const FVector Corners[8] =
-			{
-				Xf.TransformPosition(FVector(LMin.X, LMin.Y, LMin.Z)),
-				Xf.TransformPosition(FVector(LMin.X, LMin.Y, LMax.Z)),
-				Xf.TransformPosition(FVector(LMin.X, LMax.Y, LMin.Z)),
-				Xf.TransformPosition(FVector(LMin.X, LMax.Y, LMax.Z)),
-				Xf.TransformPosition(FVector(LMax.X, LMin.Y, LMin.Z)),
-				Xf.TransformPosition(FVector(LMax.X, LMin.Y, LMax.Z)),
-				Xf.TransformPosition(FVector(LMax.X, LMax.Y, LMin.Z)),
-				Xf.TransformPosition(FVector(LMax.X, LMax.Y, LMax.Z)),
-			};
-
-			// project each corner on axis and update min/max
-			for (const FVector& P : Corners)
-			{
-				const float T = FVector::DotProduct(P, N);
-				OutMin = FMath::Min(OutMin, T);
-				OutMax = FMath::Max(OutMax, T);
-				bHasAny = true;
-			}
-
-			continue;
-		}
-
-		// fallback for non static mesh
 		const FVector O = Prim->Bounds.Origin;
 		const FVector E = Prim->Bounds.BoxExtent;
 
@@ -130,25 +95,134 @@ static bool GetActorMinMaxAlongAxis(AActor* Actor, const FVector& Axis, float& O
 			O + FVector(E.X, -E.Y, -E.Z),
 			O + FVector(E.X, -E.Y,  E.Z),
 			O + FVector(E.X,  E.Y, -E.Z),
-			O + FVector(E.X,  E.Y,  E.Z),
+			O + FVector(E.X,  E.Y,  E.Z)
 		};
 
-		// project each corner onto axis and update min/max
 		for (const FVector& P : Corners)
 		{
 			const float T = FVector::DotProduct(P, N);
-			OutMin = FMath::Min(OutMin, T);
-			OutMax = FMath::Max(OutMax, T);
+			MinT = FMath::Min(MinT, T);
+			MaxT = FMath::Max(MaxT, T);
 			bHasAny = true;
 		}
 	}
 
-	return bHasAny;
+	if (!bHasAny)
+	{
+		return false;
+	}
+
+	OutMinT = MinT;
+	OutMaxT = MaxT;
+	return true;
+}
+
+namespace
+{
+	struct FRepositionClaim
+	{
+		TWeakObjectPtr<AActor> Claimant;
+		FVector Location = FVector::ZeroVector;
+		float Radius = 0.0f;
+		float ExpireTime = 0.0f;
+	};
+
+	static TMap<TWeakObjectPtr<AActor>, TArray<FRepositionClaim>> GRepositionClaims;
+
+	static void CleanupRepositionClaims(const float Now)
+	{
+		for (auto It = GRepositionClaims.CreateIterator(); It; ++It)
+		{
+			const TWeakObjectPtr<AActor> Wall = It.Key();
+			if (!Wall.IsValid())
+			{
+				It.RemoveCurrent();
+				continue;
+			}
+
+			TArray<FRepositionClaim>& Claims = It.Value();
+			for (int32 Idx = Claims.Num() - 1; Idx >= 0; --Idx)
+			{
+				const bool bExpired = (Claims[Idx].ExpireTime <= Now);
+				const bool bDead = !Claims[Idx].Claimant.IsValid();
+				if (bExpired || bDead)
+				{
+					Claims.RemoveAtSwap(Idx);
+				}
+			}
+
+			if (Claims.Num() == 0)
+			{
+				It.RemoveCurrent();
+			}
+		}
+	}
+
+	static bool IsClaimedNear(AActor* WallActor, const FVector& Loc, const float Radius, AActor* Self, const float Now)
+	{
+		if (!WallActor)
+		{
+			return false;
+		}
+
+		TArray<FRepositionClaim>* ClaimsPtr = GRepositionClaims.Find(WallActor);
+		if (!ClaimsPtr)
+		{
+			return false;
+		}
+
+		for (const FRepositionClaim& Claim : *ClaimsPtr)
+		{
+			if (Claim.ExpireTime <= Now)
+			{
+				continue;
+			}
+
+			AActor* ClaimantActor = Claim.Claimant.Get();
+			if (!ClaimantActor || ClaimantActor == Self)
+			{
+				continue;
+			}
+
+			const float Combined = FMath::Max(0.0f, Claim.Radius + Radius);
+			if (FVector::DistSquared2D(Claim.Location, Loc) <= FMath::Square(Combined))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	static void SetClaim(AActor* WallActor, const FVector& Loc, const float Radius, AActor* Self, const float Now, const float Duration)
+	{
+		if (!WallActor || !Self)
+		{
+			return;
+		}
+
+		TArray<FRepositionClaim>& Claims = GRepositionClaims.FindOrAdd(WallActor);
+
+		for (int32 Idx = Claims.Num() - 1; Idx >= 0; --Idx)
+		{
+			if (Claims[Idx].Claimant.Get() == Self)
+			{
+				Claims.RemoveAtSwap(Idx);
+			}
+		}
+
+		FRepositionClaim NewClaim;
+		NewClaim.Claimant = Self;
+		NewClaim.Location = Loc;
+		NewClaim.Radius = Radius;
+		NewClaim.ExpireTime = Now + FMath::Max(0.05f, Duration);
+
+		Claims.Add(NewClaim);
+	}
 }
 
 EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
-	// get refs
 	UBlackboardComponent* BB = OwnerComp.GetBlackboardComponent();
 	AAIController* AIC = OwnerComp.GetAIOwner();
 	APawn* Pawn = AIC ? AIC->GetPawn() : nullptr;
@@ -158,55 +232,41 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 		return EBTNodeResult::Failed;
 	}
 
-	// always reset outputs so we never keep stale reposition data
 	BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
 	BB->ClearValue(RepositionLocationKey.SelectedKeyName);
 
-	// get current cover point
-	AAICS_CoverPoint* CurrentCover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
-	if (!CurrentCover)
+	const float Now = Pawn->GetWorld() ? Pawn->GetWorld()->GetTimeSeconds() : 0.0f;
+	CleanupRepositionClaims(Now);
+
+	float ClaimRadius = 60.0f;
+	if (UCapsuleComponent* Capsule = Pawn->FindComponentByClass<UCapsuleComponent>())
 	{
-		BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
+		ClaimRadius = Capsule->GetScaledCapsuleRadius() * FMath::Max(0.1f, RepositionClaimRadiusMultiplier);
+	}
+
+	AAICS_CoverPoint* Cover = Cast<AAICS_CoverPoint>(BB->GetValueAsObject(CurrentCoverKey.SelectedKeyName));
+	if (!Cover)
+	{
 		return EBTNodeResult::Succeeded;
 	}
 
-	// decide what direction bias we want for next movement (next cover is a hint, but we can ignore it if stale)
+	const FVector CoverLoc = Cover->GetActorLocation();
+	const FVector CoverForward = Cover->GetActorForwardVector().GetSafeNormal2D();
+	const FVector AlongCover = FVector::CrossProduct(FVector::UpVector, CoverForward).GetSafeNormal2D();
+
 	const FVector ObjectiveLoc = BB->GetValueAsVector(ObjectiveLocationKey.SelectedKeyName);
-	const FVector CoverLoc = CurrentCover->GetActorLocation();
 
-	const AActor* NextCoverActor = Cast<AActor>(BB->GetValueAsObject(NextCoverKey.SelectedKeyName));
+	AActor* NextCoverActor = Cast<AActor>(BB->GetValueAsObject(NextCoverKey.SelectedKeyName));
 
-	// build 2d dirs
-	FVector ToObj2D = ObjectiveLoc - CoverLoc;
-	ToObj2D.Z = 0.0f;
-	const bool bHasObjDir = ToObj2D.Normalize();
-
-	FVector ToNext2D = FVector::ZeroVector;
-	bool bHasNextDir = false;
-
-	if (NextCoverActor && NextCoverActor != CurrentCover)
-	{
-		ToNext2D = NextCoverActor->GetActorLocation() - CoverLoc;
-		ToNext2D.Z = 0.0f;
-
-		// reject tiny / meaningless next dir
-		if (!ToNext2D.IsNearlyZero(25.0f))
-		{
-			ToNext2D.Normalize();
-			bHasNextDir = true;
-		}
-	}
-
-	// use next cover only if it is not obviously pointing away from the objective
 	bool bUseNext = false;
-	if (bHasNextDir)
+	if (NextCoverActor)
 	{
-		if (bHasObjDir)
+		const FVector ToNext2D = (NextCoverActor->GetActorLocation() - CoverLoc).GetSafeNormal2D();
+		const FVector ToObj2D = (ObjectiveLoc - CoverLoc).GetSafeNormal2D();
+
+		if (!ToNext2D.IsNearlyZero() && !ToObj2D.IsNearlyZero())
 		{
 			const float Agreement = FVector::DotProduct(ToNext2D, ToObj2D);
-
-			// if next dir points strongly away from the objective, treat it as stale
-			// tweak this threshold later if you want
 			bUseNext = (Agreement > -0.2f);
 		}
 		else
@@ -215,120 +275,94 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 		}
 	}
 
-	// pick the effective direction target location
 	const FVector DirectionTargetLoc = (bUseNext && NextCoverActor) ? NextCoverActor->GetActorLocation() : ObjectiveLoc;
 
-	// get nav system
-	UNavigationSystemV1* NavSys = UNavigationSystemV1::GetCurrent(Pawn->GetWorld());
-	if (!NavSys)
+	AActor* CoverActor = nullptr;
 	{
-		BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
-		return EBTNodeResult::Succeeded;
-	}
+		FHitResult Hit;
+		const FVector Start = CoverLoc + FVector(0, 0, HighTraceHeight);
+		const FVector End = DirectionTargetLoc + FVector(0, 0, HighTraceHeight);
 
-	FVector ExitTargetLoc = DirectionTargetLoc;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(CalcRepositionLocation), false);
+		Params.AddIgnoredActor(Pawn);
+		Params.AddIgnoredActor(Cover);
 
-	// try to snap exit target to navmesh so path checks dont fail for dumb reasons
-	{
-		FNavLocation ExitProjected;
-		const FVector Extent(NavProjectExtent, NavProjectExtent, NavProjectExtent);
-		if (NavSys->ProjectPointToNavigation(ExitTargetLoc, ExitProjected, Extent))
+		const bool bHit = Pawn->GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
+		if (bHit && Hit.GetActor())
 		{
-			ExitTargetLoc = ExitProjected.Location;
+			CoverActor = Hit.GetActor();
+		}
+
+		if (bDebugDraw)
+		{
+			DrawDebugLine(Pawn->GetWorld(), Start, End, bHit ? FColor::Red : FColor::Green, false, DebugDrawTime, 0, 1.0f);
 		}
 	}
 
-	// calc sideways dir along cover wall using cover facing arrow
-	const FVector Facing = CurrentCover->GetFacingDirection().GetSafeNormal2D();
-	FVector AlongCover = FVector::CrossProduct(FVector::UpVector, Facing).GetSafeNormal2D();
-	if (AlongCover.IsNearlyZero())
+	if (!CoverActor)
 	{
-		AlongCover = Pawn->GetActorRightVector().GetSafeNormal2D();
+		return EBTNodeResult::Succeeded;
 	}
 
-	// calc/decide preferred side left v right
-	const FVector ToTarget = (DirectionTargetLoc - CoverLoc).GetSafeNormal2D();
-	const float SideDot = FVector::DotProduct(AlongCover, ToTarget);
+	float MinT = 0.0f;
+	float MaxT = 0.0f;
+	if (!GetActorMinMaxAlongAxis(CoverActor, AlongCover, MinT, MaxT))
+	{
+		return EBTNodeResult::Succeeded;
+	}
 
-	const FVector PreferredSide = (SideDot >= 0.0f) ? AlongCover : -AlongCover;
-	const FVector OtherSide = -PreferredSide;
+	const FVector AxisN = AlongCover.GetSafeNormal2D();
+	const float CoverT = FVector::DotProduct(CoverLoc, AxisN);
 
-	// decide trace heighs based on cover types (high/low)
-	const float ThreatHeight = HighTraceHeight;
-	const float TargetHeight = (CurrentCover->CoverType == ECoverType::Low) ? LowTraceHeight : HighTraceHeight;
+	const FVector RawEdgePlus = CoverLoc + AxisN * (MaxT - CoverT);
+	const FVector RawEdgeMinus = CoverLoc + AxisN * (MinT - CoverT);
 
-	// helper lambda functions
-	// find the cover mesh between cover point and objective
-	auto TraceToObjectiveGetHit = [&](FHitResult& OutHit) -> bool
-		{
-			const FVector Start = CoverLoc + FVector(0, 0, TargetHeight);
-			const FVector End = ObjectiveLoc + FVector(0, 0, ThreatHeight);
+	FVector EdgePlus = RawEdgePlus - AxisN * EdgeInset;
+	FVector EdgeMinus = RawEdgeMinus + AxisN * EdgeInset;
 
-			FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionCoverPick), false);
-			Params.AddIgnoredActor(Pawn);
-			Params.AddIgnoredActor(CurrentCover);
+	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(Pawn->GetWorld());
+	if (!NavSys)
+	{
+		return EBTNodeResult::Succeeded;
+	}
 
-			return Pawn->GetWorld()->LineTraceSingleByChannel(OutHit, Start, End, ECC_Visibility, Params);
-		};
-
-	// checks if the repos location is behind cover or not
 	auto IsBlockedFromObjective = [&](const FVector& TestLoc) -> bool
 		{
-			const FVector Start = ObjectiveLoc + FVector(0, 0, ThreatHeight);
-			const FVector End = TestLoc + FVector(0, 0, TargetHeight);
+			const FVector Start = DirectionTargetLoc + FVector(0, 0, HighTraceHeight);
+			const FVector End = TestLoc + FVector(0, 0, HighTraceHeight);
 
 			FHitResult Hit;
-			FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionTrace), false);
+			FCollisionQueryParams Params(SCENE_QUERY_STAT(RepositionCoverBlock), false);
 			Params.AddIgnoredActor(Pawn);
 
 			return Pawn->GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
 		};
 
-	// checks if moving to edge causes weird nav pathing
-	auto IsGoodLateralMove = [&](const FVector& Dest, const FVector& SideDir) -> bool
+	auto IsGoodLateralMove = [&](const FVector& TestLoc, const FVector& SideDir) -> bool
 		{
-			FVector StartLoc = Pawn->GetActorLocation();
-
-			{
-				FNavLocation StartProjected;
-				const FVector Extent(NavProjectExtent, NavProjectExtent, NavProjectExtent);
-				if (NavSys->ProjectPointToNavigation(StartLoc, StartProjected, Extent))
-				{
-					StartLoc = StartProjected.Location;
-				}
-			}
-
-			UNavigationPath* Path = NavSys->FindPathToLocationSynchronously(Pawn->GetWorld(), StartLoc, Dest, Pawn);
-			if (!Path || !Path->IsValid() || Path->IsPartial())
+			UNavigationPath* Path = NavSys->FindPathToLocationSynchronously(Pawn->GetWorld(), Pawn->GetActorLocation(), TestLoc, Pawn);
+			if (!Path || Path->PathPoints.Num() < 2)
 			{
 				return false;
 			}
 
-			const TArray<FVector>& Pts = Path->PathPoints;
-			if (Pts.Num() < 2)
-			{
-				return true;
-			}
+			const float DirectDist = FVector::Dist2D(Pawn->GetActorLocation(), TestLoc);
+			const float PathDist = Path->GetPathLength();
 
-			float PathLen2D = 0.0f;
-			for (int32 i = 1; i < Pts.Num(); ++i)
-			{
-				PathLen2D += FVector::Dist2D(Pts[i - 1], Pts[i]);
-			}
-
-			const float Straight2D = FVector::Dist2D(StartLoc, Dest);
-			if (Straight2D < 1.0f)
-			{
-				return true;
-			}
-
-			if (PathLen2D > Straight2D * MaxLateralDetourRatio)
+			if (DirectDist <= KINDA_SMALL_NUMBER)
 			{
 				return false;
 			}
 
-			const FVector FirstDir = (Pts[1] - Pts[0]).GetSafeNormal2D();
-			if (FVector::DotProduct(FirstDir, SideDir.GetSafeNormal2D()) < MinFirstStepDot)
+			if (PathDist / DirectDist > MaxLateralDetourRatio)
+			{
+				return false;
+			}
+
+			const FVector FirstStep = (Path->PathPoints[1] - Path->PathPoints[0]).GetSafeNormal2D();
+			const FVector SideN = SideDir.GetSafeNormal2D();
+
+			if (FVector::DotProduct(FirstStep, SideN) < MinFirstStepDot)
 			{
 				return false;
 			}
@@ -336,200 +370,118 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 			return true;
 		};
 
-	// checks if this edge is a good launch point to move toward the next cover / objective
-	// checks if leaving from this edge toward the next cover would cause a backtrack / big detour
-	auto IsGoodExitMove = [&](const FVector& FromEdge, const FVector& SideDir) -> bool
+	auto IsGoodExitMove = [&](const FVector& TestLoc, const FVector& SideDir) -> bool
 		{
-			UNavigationPath* Path = NavSys->FindPathToLocationSynchronously(Pawn->GetWorld(), FromEdge, ExitTargetLoc, Pawn);
-			if (!Path || !Path->IsValid() || Path->IsPartial())
-			{
-				return false;
-			}
+			const FVector MoveDir = (TestLoc - Pawn->GetActorLocation()).GetSafeNormal2D();
+			const FVector SideN = SideDir.GetSafeNormal2D();
 
-			const TArray<FVector>& Pts = Path->PathPoints;
-			if (Pts.Num() < 2)
-			{
-				return true;
-			}
-
-			// reject if the first step immediately goes against the side we want
-			const FVector FirstDir = (Pts[1] - Pts[0]).GetSafeNormal2D();
-			if (FVector::DotProduct(FirstDir, SideDir.GetSafeNormal2D()) < -0.15f)
-			{
-				return false;
-			}
-
-			// reject if the path is way longer than a straight line
-			float PathLen2D = 0.0f;
-			for (int32 i = 1; i < Pts.Num(); ++i)
-			{
-				PathLen2D += FVector::Dist2D(Pts[i - 1], Pts[i]);
-			}
-
-			const float Straight2D = FVector::Dist2D(FromEdge, ExitTargetLoc);
-			if (Straight2D > 1.0f && PathLen2D > Straight2D * 1.5f)
-			{
-				return false;
-			}
-
-			return true;
+			return FVector::DotProduct(MoveDir, SideN) > -0.5f;
 		};
 
-	FHitResult CoverHit;
-	AActor* CoverActor = nullptr;
-
-	// get cover mesh actor
-	if (TraceToObjectiveGetHit(CoverHit))
-	{
-		CoverActor = CoverHit.GetActor();
-	}
-
-	if (!CoverActor)
-	{
-		BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
-		return EBTNodeResult::Succeeded;
-	}
-
-	// get cover actor mesh extents along wall axis
-	float MinT = 0.0f;
-	float MaxT = 0.0f;
-	if (!GetActorMinMaxAlongAxis(CoverActor, AlongCover, MinT, MaxT))
-	{
-		BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
-		return EBTNodeResult::Succeeded;
-	}
-
-	// convert min/max values to edge positions
-	const FVector AxisN = AlongCover.GetSafeNormal();
-	const float CoverT = FVector::DotProduct(CoverLoc, AxisN);
-
-	// calc point on actor at positive edge along axis
-	FVector RawEdgePlus = CoverLoc + AxisN * (MaxT - CoverT);
-	// calc point on actor at negative edge alon axis
-	FVector RawEdgeMinus = CoverLoc + AxisN * (MinT - CoverT);
-
-	// add edge inset so we stand inside more
-	FVector EdgePlus = RawEdgePlus - AxisN * EdgeInset;
-	FVector EdgeMinus = RawEdgeMinus + AxisN * EdgeInset;
+	const FVector PreferredSide = FVector::DotProduct((DirectionTargetLoc - CoverLoc).GetSafeNormal2D(), AxisN) >= 0.0f ? AxisN : -AxisN;
 
 	auto ValidateAndFixEdge = [&](const FVector& InEdge, const FVector& SideDir, FVector& OutEdge) -> bool
 		{
 			FVector TryLoc = InEdge;
 
+			bool bDrewClaimDebug = false;
+
 			for (int32 TryIdx = 0; TryIdx <= MaxEdgeInwardTries; ++TryIdx)
 			{
 				FVector Proj;
 
-				// project to navmesh
 				if (ProjectToNavLimited(NavSys, TryLoc, NavProjectExtent, MaxNavSnapDistance2D, Proj))
 				{
 					if (IsBlockedFromObjective(Proj))
 					{
-						if (IsGoodLateralMove(Proj, SideDir))
+						if (!IsClaimedNear(CoverActor, Proj, ClaimRadius, Pawn, Now))
 						{
-							if (IsGoodExitMove(Proj, SideDir))
+							if (IsGoodLateralMove(Proj, SideDir))
 							{
-								OutEdge = Proj;
-								return true;
+								if (IsGoodExitMove(Proj, SideDir))
+								{
+									OutEdge = Proj;
+									return true;
+								}
 							}
+						}
+						else if (bDebugDraw && !bDrewClaimDebug)
+						{
+							DrawDebugSphere(Pawn->GetWorld(), Proj, ClaimRadius, 8, FColor::Orange, false, DebugDrawTime);
+							bDrewClaimDebug = true;
 						}
 					}
 				}
 
-				// step inward from this side
 				TryLoc = TryLoc - SideDir.GetSafeNormal2D() * EdgeInwardStep;
 			}
 
 			return false;
 		};
 
-	// decide raw edge side left right
 	const bool bPlusIsPreferred = FVector::DotProduct(AxisN, PreferredSide) > 0.0f;
 
 	const FVector PrefRaw = bPlusIsPreferred ? EdgePlus : EdgeMinus;
 	const FVector OtherRaw = bPlusIsPreferred ? EdgeMinus : EdgePlus;
 
-	FVector EdgePref = FVector::ZeroVector;
-	FVector EdgeOther = FVector::ZeroVector;
+	FVector PrefFixed;
+	FVector OtherFixed;
 
-	// validate both edges
-	const bool bHasPref = ValidateAndFixEdge(PrefRaw, PreferredSide, EdgePref);
-	const bool bHasOther = ValidateAndFixEdge(OtherRaw, OtherSide, EdgeOther);
+	const bool bPrefValid = ValidateAndFixEdge(PrefRaw, PreferredSide, PrefFixed);
+	const bool bOtherValid = ValidateAndFixEdge(OtherRaw, -PreferredSide, OtherFixed);
 
-	// choose best repos loc
 	bool bHasBest = false;
 	FVector BestLoc = FVector::ZeroVector;
 
-	if (bHasPref && !bHasOther)
+	if (bPrefValid)
 	{
 		bHasBest = true;
-		BestLoc = EdgePref;
+		BestLoc = PrefFixed;
 	}
-	else if (!bHasPref && bHasOther)
+	else if (bOtherValid)
 	{
 		bHasBest = true;
-		BestLoc = EdgeOther;
-	}
-	else if (bHasPref && bHasOther)
-	{
-		// prefer the edge that gives a better exit toward the effective target (next cover if valid, else objective)
-		const float DistPref = FVector::Dist2D(EdgePref, DirectionTargetLoc);
-		const float DistOther = FVector::Dist2D(EdgeOther, DirectionTargetLoc);
-
-		bHasBest = true;
-		BestLoc = (DistPref <= DistOther) ? EdgePref : EdgeOther;
+		BestLoc = OtherFixed;
 	}
 
-	// debug draw
 	if (bDebugDraw)
 	{
-		const FVector CoverZ = CoverLoc + FVector(0, 0, TargetHeight);
-		DrawDebugSphere(Pawn->GetWorld(), CoverZ, 18.0f, 12, FColor::Cyan, false, DebugDrawTime);
+		DrawDebugSphere(Pawn->GetWorld(), CoverLoc, 16.0f, 8, FColor::Cyan, false, DebugDrawTime);
 
-		if (CoverActor)
+		if (bPrefValid)
 		{
-			const FVector CA = CoverActor->GetActorLocation() + FVector(0, 0, TargetHeight);
-			DrawDebugSphere(Pawn->GetWorld(), CA, 16.0f, 12, FColor::Orange, false, DebugDrawTime);
+			DrawDebugSphere(Pawn->GetWorld(), PrefFixed, 18.0f, 12, FColor::Green, false, DebugDrawTime);
+		}
+		else
+		{
+			DrawDebugSphere(Pawn->GetWorld(), PrefRaw, 18.0f, 12, FColor::Red, false, DebugDrawTime);
 		}
 
-		// draw the effective direction target we're using for edge choice
-		DrawDebugSphere(Pawn->GetWorld(), DirectionTargetLoc + FVector(0, 0, TargetHeight), 18.0f, 12, FColor::Yellow, false, DebugDrawTime);
-		DrawDebugLine(Pawn->GetWorld(), CoverZ, DirectionTargetLoc + FVector(0, 0, TargetHeight), FColor::Yellow, false, DebugDrawTime, 0, 1.5f);
-
-		// optionally show the raw next cover too (so you can see when we ignored it)
-		if (NextCoverActor)
+		if (bOtherValid)
 		{
-			DrawDebugSphere(Pawn->GetWorld(), NextCoverActor->GetActorLocation() + FVector(0, 0, TargetHeight), 10.0f, 10, FColor::Purple, false, DebugDrawTime);
+			DrawDebugSphere(Pawn->GetWorld(), OtherFixed, 18.0f, 12, FColor::Green, false, DebugDrawTime);
 		}
-
-		DrawDebugSphere(Pawn->GetWorld(), EdgePlus + FVector(0, 0, TargetHeight), 12.0f, 12, FColor::Silver, false, DebugDrawTime);
-		DrawDebugSphere(Pawn->GetWorld(), EdgeMinus + FVector(0, 0, TargetHeight), 12.0f, 12, FColor::Silver, false, DebugDrawTime);
-
-		if (bHasPref)
+		else
 		{
-			DrawDebugSphere(Pawn->GetWorld(), EdgePref + FVector(0, 0, TargetHeight), 14.0f, 12, FColor::Blue, false, DebugDrawTime);
-		}
-		if (bHasOther)
-		{
-			DrawDebugSphere(Pawn->GetWorld(), EdgeOther + FVector(0, 0, TargetHeight), 14.0f, 12, FColor::Magenta, false, DebugDrawTime);
+			DrawDebugSphere(Pawn->GetWorld(), OtherRaw, 18.0f, 12, FColor::Red, false, DebugDrawTime);
 		}
 
 		if (bHasBest)
 		{
-			DrawDebugSphere(Pawn->GetWorld(), BestLoc + FVector(0, 0, TargetHeight), 24.0f, 16, FColor::White, false, DebugDrawTime);
-
-			const FVector Start = ObjectiveLoc + FVector(0, 0, ThreatHeight);
-			const FVector End = BestLoc + FVector(0, 0, TargetHeight);
-			DrawDebugLine(Pawn->GetWorld(), Start, End, FColor::Green, false, DebugDrawTime, 0, 2.0f);
+			DrawDebugSphere(Pawn->GetWorld(), BestLoc, 22.0f, 12, FColor::Yellow, false, DebugDrawTime);
 		}
 	}
 
 	BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, bHasBest);
 	if (bHasBest)
 	{
+		if (CoverActor)
+		{
+			SetClaim(CoverActor, BestLoc, ClaimRadius, Pawn, Now, RepositionClaimDuration);
+		}
+
 		BB->SetValueAsVector(RepositionLocationKey.SelectedKeyName, BestLoc);
 	}
 
 	return EBTNodeResult::Succeeded;
 }
-

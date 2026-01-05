@@ -1,10 +1,9 @@
 #include "AICS_EQSTest_CoverByType.h"
 
-#include "DrawDebugHelpers.h"
-#include "EnvironmentQuery/Contexts/EnvQueryContext_Querier.h"
-#include "EnvironmentQuery/Items/EnvQueryItemType_ActorBase.h"
 #include "AIController.h"
 #include "BehaviorTree/BlackboardComponent.h"
+#include "EnvironmentQuery/Contexts/EnvQueryContext_Querier.h"
+#include "EnvironmentQuery/Items/EnvQueryItemType_ActorBase.h"
 
 #include "AICoverSystem/AI/CoverQuery/AICS_CoverPoint.h"
 
@@ -60,7 +59,7 @@ void UAICS_EQSTest_CoverByType::RunTest(FEnvQueryInstance& QueryInstance) const
 		if (BB && !EnemyActorKeyName.IsNone())
 		{
 			AActor* EnemyActor = Cast<AActor>(BB->GetValueAsObject(EnemyActorKeyName));
-			if (EnemyActor) 
+			if (EnemyActor)
 			{
 				ThreatActorToIgnore = EnemyActor;
 
@@ -73,7 +72,6 @@ void UAICS_EQSTest_CoverByType::RunTest(FEnvQueryInstance& QueryInstance) const
 				{
 					ThreatLoc = BB->GetValueAsVector(LastKnownEnemyLocationKeyName);
 				}
-
 			}
 		}
 	}
@@ -108,7 +106,7 @@ void UAICS_EQSTest_CoverByType::RunTest(FEnvQueryInstance& QueryInstance) const
 		const float TargetHeight =
 			(CoverPoint->CoverType == ECoverType::Low) ? LowCoverTraceHeight : HighCoverTraceHeight;
 
-		const FVector Start = ObjectiveLoc + FVector(0.0f, 0.0f, ThreatHeight);
+		const FVector Start = ThreatLoc + FVector(0.0f, 0.0f, ThreatHeight);
 		const FVector End = CoverPoint->GetActorLocation() + FVector(0.0f, 0.0f, TargetHeight);
 
 		FHitResult Hit;
@@ -121,6 +119,5 @@ void UAICS_EQSTest_CoverByType::RunTest(FEnvQueryInstance& QueryInstance) const
 		{
 			It.ForceItemState(EEnvItemStatus::Failed);
 		}
-
 	}
 }

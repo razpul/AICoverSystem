@@ -6,9 +6,6 @@
 #include "EnvironmentQuery/EnvQueryTest.h"
 #include "AICS_EQSTest_CoverByType.generated.h"
 
-/**
- * 
- */
 UCLASS()
 class AICOVERSYSTEM_API UAICS_EQSTest_CoverByType : public UEnvQueryTest
 {
@@ -20,25 +17,27 @@ public:
 	virtual void RunTest(FEnvQueryInstance& QueryInstance) const override;
 
 protected:
-	UPROPERTY(EditDefaultsOnly, Category = "Cover")
+
+	UPROPERTY(EditDefaultsOnly, Category = "cover")
 	TSubclassOf<class UEnvQueryContext> ObjectiveLocationContext;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Threat")
+	// blackboard keys
+	UPROPERTY(EditDefaultsOnly, Category = "threat")
 	FName EnemyActorKeyName = TEXT("EnemyActor");
 
-	UPROPERTY(EditDefaultsOnly, Category = "Threat")
+	UPROPERTY(EditDefaultsOnly, Category = "threat")
 	FName LastKnownEnemyLocationKeyName = TEXT("LastKnownEnemyLocation");
 
-	UPROPERTY(EditDefaultsOnly, Category = "Threat")
+	UPROPERTY(EditDefaultsOnly, Category = "threat")
 	FName HasLOSKeyName = TEXT("HasLOS");
 
-	UPROPERTY(EditDefaultsOnly, Category = "Cover")
+	// trace target height depends on cover type
+	UPROPERTY(EditDefaultsOnly, Category = "cover")
 	float LowCoverTraceHeight = 60.0f;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Cover")
-	float HighCoverTraceHeight = 120.f;
+	UPROPERTY(EditDefaultsOnly, Category = "cover")
+	float HighCoverTraceHeight = 120.0f;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Cover")
+	UPROPERTY(EditDefaultsOnly, Category = "cover")
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_Visibility;
-	
 };
