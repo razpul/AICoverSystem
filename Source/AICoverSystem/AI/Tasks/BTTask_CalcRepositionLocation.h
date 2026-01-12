@@ -83,4 +83,7 @@ protected:
 	// sets debug draw time for this task
 	UPROPERTY(EditAnywhere, Category = "Debug")
 	float DebugDrawTime = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Respoition")
+	bool DisableReposition = true;
 };

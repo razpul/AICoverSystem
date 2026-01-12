@@ -232,6 +232,11 @@ EBTNodeResult::Type UBTTask_CalcRepositionLocation::ExecuteTask(UBehaviorTreeCom
 		return EBTNodeResult::Failed;
 	}
 
+	if (DisableReposition)
+	{
+		return EBTNodeResult::Succeeded;
+	}
+
 	BB->SetValueAsBool(HasRepositionLocationKey.SelectedKeyName, false);
 	BB->ClearValue(RepositionLocationKey.SelectedKeyName);
 
